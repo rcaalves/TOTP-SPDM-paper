@@ -25,10 +25,9 @@
 #define USB_PRODUCT_ID 0x0666			// Product ID of the SPDM/TOTP device
 #define MAX_TRIES 2						// Max amount of tries to find SPDM device
 #define TIMEOUT_MS 5000					// Wait time in ms to find SPDM device
-#define VERIFICATION_PERIOD_MS 4000 	// Wait time in ms to do SPDM/TOTP checks
-// #define BUFFER_SIZE 64
-// it is possible to reduce TOTP_TIMESTEP to speed experiments up (e.g. 2 seconds)
-#define TOTP_TIMESTEP 30				// Timestep for TOTP checks (must be the same in dev-totp-spdm.c)
+// it is possible to reduce VERIFICATION_PERIOD_MS to speed experiments up (e.g. 4 seconds)
+#define VERIFICATION_PERIOD_MS 40000 	// Wait time in ms to do SPDM/TOTP checks
+#define TOTP_TIMESTEP 30				// Timestep for TOTP checks [seconds] (must be the same in dev-totp-spdm.c)
 #define TOTP_HEX_SIZE 6					// TOTP header size in bytes
 #define LEN_HEX_SIZE 4					// SPDM length header size in byes
 #define SPDM_RECEIVE_OFFSET 4			// = LEN_HEX_SIZE
