@@ -26,6 +26,12 @@
 #include "mctp.h"
 #pragma GCC diagnostic pop
 
+// perf includes
+#include <linux/perf_event.h>
+#include <linux/hw_breakpoint.h>
+#include <asm/unistd.h>
+#include <unistd.h>
+
 #define TOTP_TIMESTEP 30            // Timestep for TOTP checks (must be the same in totp_spdm_driver.c)
 
 #define SPDMDEV_MAX_BUF (4096*4)    // Max size for SPDM buffer
@@ -163,6 +169,81 @@ uint8_t* _hmacKey;
 uint8_t _keyLength;
 uint8_t _timeZoneOffset;
 uint32_t _timeStep;
+
+
+/*
+* Perf helper functions and formats
+*/
+
+#define NUM_PERF_EVENTS 3
+enum { CYCLES = 0, TASK_CLOCK = 1, INSTRUCTIONS = 2 };
+
+struct read_format {
+ uint64_t nr;            /* The number of events */
+ // uint64_t time_enabled;  /* if PERF_FORMAT_TOTAL_TIME_ENABLED */
+ uint64_t time_running;  /* if PERF_FORMAT_TOTAL_TIME_RUNNING */
+ struct {
+     uint64_t value;     /* The value of the event */
+     // uint64_t id;        /* if PERF_FORMAT_ID */
+ } values[NUM_PERF_EVENTS];
+};
+
+static long
+usb_totp_perf_event_open(struct perf_event_attr *hw_event, pid_t pid,
+                int cpu, int group_fd, unsigned long flags)
+{
+    int ret;
+
+    ret = syscall(__NR_perf_event_open, hw_event, pid, cpu,
+                    group_fd, flags);
+    return ret;
+}
+
+return_status usb_totp_init_perf_events(int *fd_cycles, int *fd_taskclock, int *fd_instructions);
+return_status usb_totp_init_perf_events(int *fd_cycles, int *fd_taskclock, int *fd_instructions) {
+  struct perf_event_attr pe;
+
+  memset(&pe, 0, sizeof(struct perf_event_attr));
+  pe.size = sizeof(struct perf_event_attr);
+  pe.disabled = 1;
+  pe.exclude_kernel = 1;
+  pe.exclude_hv = 1;
+  pe.exclude_guest = 1;
+  pe.read_format = PERF_FORMAT_GROUP |
+                   // PERF_FORMAT_TOTAL_TIME_ENABLED |
+                   PERF_FORMAT_TOTAL_TIME_RUNNING |
+                   // PERF_FORMAT_ID;
+                   0;
+
+  pe.type = PERF_TYPE_HARDWARE;
+  pe.config = PERF_COUNT_HW_CPU_CYCLES;
+
+  *fd_cycles = usb_totp_perf_event_open(&pe, 0, -1, -1, 0);
+  if (*fd_cycles == -1) {
+      fprintf(stderr, "Error opening perf leader fd %llx\n", pe.config);
+      return RETURN_DEVICE_ERROR;
+  }
+
+  pe.type = PERF_TYPE_SOFTWARE;
+  pe.config = PERF_COUNT_SW_TASK_CLOCK;
+
+  *fd_taskclock = usb_totp_perf_event_open(&pe, 0, -1, *fd_cycles, 0);
+  if (*fd_taskclock == -1) {
+      fprintf(stderr, "Error opening perf TASK_CLOCK fd %llx\n", pe.config);
+      return RETURN_DEVICE_ERROR;
+  }
+
+  pe.type = PERF_TYPE_HARDWARE;
+  pe.config = PERF_COUNT_HW_INSTRUCTIONS;
+
+  *fd_instructions = usb_totp_perf_event_open(&pe, 0, -1, *fd_cycles, 0);
+  if (*fd_instructions == -1) {
+      fprintf(stderr, "Error opening perf INSTRUCTIONS fd %llx\n", pe.config);
+      return RETURN_DEVICE_ERROR;
+  }
+
+  return RETURN_SUCCESS;
+}
 
 /* 
 * Device-specific defines
@@ -640,6 +721,16 @@ static void *usb_totp_spdm_io_thread(void *opaque)
 {
     USBTotpSpdmState *s = opaque;
     return_status status;
+    uint8 request_code;
+
+    // perf variables
+    int local_cyc, local_clock, local_inst;
+    struct read_format rf;
+    usb_totp_init_perf_events(&local_cyc, &local_clock, &local_inst);
+    static uint64_t cycle_accum = 0;
+    static uint64_t clock_accum = 0;
+    static uint64_t instr_accum = 0;
+    static uint8_t should_sum = 0;
 
     while (true) {
         USB_SPDM_PRINT("usb_totp_spdm_io_thread() loop\n");
@@ -649,9 +740,45 @@ static void *usb_totp_spdm_io_thread(void *opaque)
         }
         spdm_receive_is_ready = 0;
 
+        // printf("\n");
+        // for (int i = 0; i < 10; i++)
+        //     printf("%02X ", spdm_buf[i]);
+        // printf("\n");
+
         qemu_mutex_unlock(&spdm_io_mutex);
 
+        ioctl(local_cyc, PERF_EVENT_IOC_RESET, PERF_IOC_FLAG_GROUP);
+        ioctl(local_cyc, PERF_EVENT_IOC_ENABLE, PERF_IOC_FLAG_GROUP);
+
         status = spdm_responder_dispatch_message (s->spdm_context);
+
+        ioctl(local_cyc, PERF_EVENT_IOC_DISABLE, PERF_IOC_FLAG_GROUP);
+        read(local_cyc, &rf, sizeof(rf));
+
+        request_code = ((spdm_message_header_t*)(((spdm_context_t *)s->spdm_context)->last_spdm_request))->request_response_code;
+
+        if (request_code == SPDM_GET_VERSION) {
+            cycle_accum = clock_accum = instr_accum = 0;
+            should_sum = 1;
+        }
+
+        // printf("%02X,\t%lu cycles,\t%lu ns,\t%lu instructions\n", request_code,
+        //   rf.values[CYCLES].value, rf.values[TASK_CLOCK].value, rf.values[INSTRUCTIONS].value);
+
+        if (should_sum) {
+            cycle_accum += rf.values[CYCLES].value;
+            clock_accum += rf.values[TASK_CLOCK].value;
+            instr_accum += rf.values[INSTRUCTIONS].value;
+        }
+        if (request_code == SPDM_FINISH || request_code == SPDM_PSK_FINISH) {
+            should_sum = 0;
+            printf("Handshake%s,\t%lu cycles,\t%lu ns,\t%lu instructions\n",
+                (request_code == SPDM_PSK_FINISH? " PSK":""), cycle_accum, clock_accum, instr_accum);
+        }
+        if (request_code == SPDM_HEARTBEAT) {
+            printf("Heartbeat,\t%lu cycles,\t%lu ns,\t%lu instructions\n",
+                rf.values[CYCLES].value, rf.values[TASK_CLOCK].value, rf.values[INSTRUCTIONS].value);
+        }
 
         if (status == RETURN_SUCCESS) {
             // load certificates and stuff
@@ -661,6 +788,10 @@ static void *usb_totp_spdm_io_thread(void *opaque)
         }
 
     }
+
+    close(local_cyc);
+    close(local_clock);
+    close(local_inst);
 
     return NULL;
 }
@@ -678,12 +809,18 @@ static return_status spdm_device_get_response(
             IN void *request,
             IN OUT uintn *response_size,
             OUT void *response) {
+
+    int local_cyc, local_clock, local_inst;
+    struct read_format rf;
+    usb_totp_init_perf_events(&local_cyc, &local_clock, &local_inst);
+
     USB_SPDM_PRINT("spdm_device_get_response \n");
 
     // Check the request size
     // If zero, this is a periodic TOTP check
     // Also check if a TOTP key has been set previously
     if (request_size <= TOTP_RANDOM_NUM_SIZE && !arr_is_zero(totp_key, TOTP_RANDOM_NUM_SIZE)){
+        ioctl(local_cyc, PERF_EVENT_IOC_ENABLE, PERF_IOC_FLAG_GROUP);
         USB_SPDM_PRINT("Periodic TOTP check\n");
         char totp_str[TOTP_HEX_SIZE];   // max TOTP size is 5 hex
         uint32_t totp_code;
@@ -701,9 +838,16 @@ static return_status spdm_device_get_response(
         // Copy TOTP value to response after the first byte
         memcpy(response + 1, &totp_str, TOTP_HEX_SIZE*sizeof(char));
         *response_size = TOTP_HEX_SIZE*sizeof(char) + 1;
+
+        ioctl(local_cyc, PERF_EVENT_IOC_DISABLE, PERF_IOC_FLAG_GROUP);
+        read(local_cyc, &rf, sizeof(rf));
+
+        printf("TOTP gen value,\t%lu cycles,\t%lu ns,\t%lu instructions\n",
+                rf.values[CYCLES].value, rf.values[TASK_CLOCK].value, rf.values[INSTRUCTIONS].value);
     }
     // Otherwise, this is a TOTP key defining message
     else {
+        ioctl(local_cyc, PERF_EVENT_IOC_ENABLE, PERF_IOC_FLAG_GROUP);
         USB_SPDM_PRINT("TOTP key definition\n");
         CSPRNG rng;
         uint64_t random_local_num;
@@ -739,7 +883,18 @@ static return_status spdm_device_get_response(
         memcpy(response + 1, &temp_totp_key, SPDM_SHA_SIZE);
         *response_size = SPDM_SHA_SIZE + 1;
         next_message_totp_check = true;
+
+        ioctl(local_cyc, PERF_EVENT_IOC_DISABLE, PERF_IOC_FLAG_GROUP);
+        read(local_cyc, &rf, sizeof(rf));
+
+        printf("TOTP genkey,\t%lu cycles,\t%lu ns,\t%lu instructions\n",
+                rf.values[CYCLES].value, rf.values[TASK_CLOCK].value, rf.values[INSTRUCTIONS].value);
     }
+
+    close(local_cyc);
+    close(local_clock);
+    close(local_inst);
+
     return RETURN_SUCCESS;
 }
 
@@ -1088,6 +1243,12 @@ static void usb_totp_spdm_handle_data(USBDevice *dev, USBPacket *p)
         }
         // TOTP message without SPDM
         else{
+
+            int local_cyc, local_clock, local_inst;
+            struct read_format rf;
+            usb_totp_init_perf_events(&local_cyc, &local_clock, &local_inst);
+
+            ioctl(local_cyc, PERF_EVENT_IOC_ENABLE, PERF_IOC_FLAG_GROUP);
             USB_SPDM_PRINT("Periodic TOTP check\n");
             char totp_str[TOTP_HEX_SIZE];   // max TOTP size is 5 hex
             uint32_t totp_code;
@@ -1101,6 +1262,17 @@ static void usb_totp_spdm_handle_data(USBDevice *dev, USBPacket *p)
 
             // Copy TOTP value to response
             usb_packet_copy(p, totp_str, TOTP_HEX_SIZE);
+
+            ioctl(local_cyc, PERF_EVENT_IOC_DISABLE, PERF_IOC_FLAG_GROUP);
+            read(local_cyc, &rf, sizeof(rf));
+
+            printf("TOTP gen value,\t%lu cycles,\t%lu ns,\t%lu instructions\n",
+                    rf.values[CYCLES].value, rf.values[TASK_CLOCK].value, rf.values[INSTRUCTIONS].value);
+
+            close(local_cyc);
+            close(local_clock);
+            close(local_inst);
+
         }
         break;
     
