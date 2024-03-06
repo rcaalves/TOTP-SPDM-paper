@@ -87,7 +87,7 @@ static uint8 m_use_slot_count = 3;
   SPDM_KEY_UPDATE_ACTION_RESPONDER
   SPDM_KEY_UPDATE_ACTION_ALL
 */
-spdm_key_update_action_t m_use_key_update_action = SPDM_KEY_UPDATE_ACTION_ALL;
+static spdm_key_update_action_t m_use_key_update_action = SPDM_KEY_UPDATE_ACTION_ALL;
 
 static uint32 m_use_hash_algo;
 static uint32 m_use_measurement_hash_algo;

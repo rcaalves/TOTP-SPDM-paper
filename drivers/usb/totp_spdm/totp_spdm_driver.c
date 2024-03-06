@@ -14,6 +14,7 @@
 // SPDM includes
 #include "spdm_auth.c"
 #include "mctp.h"
+#include "spdm_secured_message_lib_internal.h"
 
 // TOTP include
 #include "TOTP.h"
@@ -37,6 +38,7 @@
 #define TOTP_KEY_CHECKS_UNTIL_REGEN 6	// Max amount of TOTP checks before
 										// needing to generate new key
 										// = log2(TOTP_RANDOM_NUM_SIZE*8) -> log2 of total of bits
+#define TOTP_KEY_FROM_MS	1			// if 0 derives key from random numbers, else uses master secret from the session
 
 
 /******************************************************/
@@ -44,14 +46,14 @@
 /******************************************************/
 
 // counter type
-#define MY_PERF_TYPE PERF_TYPE_SOFTWARE
-#define MY_PERF_CONFIG PERF_COUNT_SW_TASK_CLOCK
+// #define MY_PERF_TYPE PERF_TYPE_SOFTWARE
+// #define MY_PERF_CONFIG PERF_COUNT_SW_TASK_CLOCK
 
 // #define MY_PERF_TYPE PERF_TYPE_HARDWARE
 // #define MY_PERF_CONFIG PERF_COUNT_HW_INSTRUCTIONS
 
-// #define MY_PERF_TYPE PERF_TYPE_HARDWARE
-// #define MY_PERF_CONFIG PERF_COUNT_HW_CPU_CYCLES
+#define MY_PERF_TYPE PERF_TYPE_HARDWARE
+#define MY_PERF_CONFIG PERF_COUNT_HW_CPU_CYCLES
 
 // SPDM_TOTP_USE_PSK = 1 => PSK handshake
 // SPDM_TOTP_USE_PSK = 0 => asym handshake
@@ -821,6 +823,41 @@ static void totp_spdm_work_handler(struct work_struct *w) {
 											);
 	perf_event_enable(event_totp_key_create);
 
+#if TOTP_KEY_FROM_MS
+	// derive TOTP key from master secret
+	int tempi;
+	spdm_secured_message_context_t* secured_message_context = spdm_get_secured_message_context_via_session_id(
+										totp_spdm_usb_struct->spdm_context,
+										totp_spdm_usb_struct->session_id);
+
+	// for (tempi = 0; tempi < TOTP_KEY_SIZE; tempi++) totp_spdm_usb_struct->totp_key[tempi] = 0;
+
+	// maybe it would be better to use the spdm_secured_message_export_master_secret() from the API
+	// but it would cost some performance
+	spdm_hkdf_expand(	secured_message_context->base_hash_algo,
+						secured_message_context->handshake_secret.export_master_secret,
+						secured_message_context->hash_size,
+						"TOTPKEY", 7,
+						totp_spdm_usb_struct->totp_key,
+						TOTP_KEY_SIZE);
+
+
+	totp_spdm_usb_struct->spdm_random_num_data_buf[0] = MCTP_MESSAGE_TYPE_VENDOR_DEFINED_IANA;
+	// Send vendor defined request to trigger totp key calculation on the device
+	spdm_send_receive_data(
+			totp_spdm_usb_struct->spdm_context,							// SPDM context
+			&totp_spdm_usb_struct->session_id,							// Session ID
+			FALSE,														// ???
+			&totp_spdm_usb_struct->spdm_random_num_data_buf,			// Local data
+			sizeof(totp_spdm_usb_struct->spdm_random_num_data_buf),		// Local data size
+			&send_receive_local_response_buf,							// Key received as response
+			&totp_spdm_usb_struct->totp_key_size);						// Key size
+
+	// printk(KERN_INFO "TOTP_KEY");
+	// for (tempi = 0; tempi < TOTP_KEY_SIZE; tempi++)
+	// 	printk(KERN_CONT " %02x", totp_spdm_usb_struct->totp_key[tempi]);
+
+#else // TOTP_KEY_FROM_MS
 	do {
 		// pr_info("Generating TOTP key.");
 		// To avoid checks in the first message exchange,
@@ -863,10 +900,11 @@ static void totp_spdm_work_handler(struct work_struct *w) {
 		// Final check to see if the loop will be done again
 		// pr_info("TOTP key size: %llu", totp_spdm_usb_struct->totp_key_size);
 	} while (totp_spdm_usb_struct->totp_key_size != TOTP_KEY_SIZE);
+#endif //TOTP_KEY_FROM_MS
 
 	perf_event_disable(event_totp_key_create);
 	counter_totp_key_create = perf_event_read_value(event_totp_key_create, &time_enabled, &time_running);
-	printk(KERN_INFO "TOTP key generated. counter: %llu\n", counter_totp_key_create);
+	printk(KERN_INFO "TOTP key generated. counter: %llu (TOTP_KEY_FROM_MS = %u)\n", counter_totp_key_create, TOTP_KEY_FROM_MS);
 
 	// delete event counter
 	perf_event_release_kernel(event_totp_key_create);
